@@ -1,17 +1,22 @@
 package com.touhid.softvideo
 
 import android.Manifest
+import android.app.Activity
+import android.app.PendingIntent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
 import android.util.Size
 import android.view.WindowManager
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -27,6 +32,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -35,6 +41,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Forward10
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
@@ -42,16 +49,21 @@ import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.ScreenRotation
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -63,6 +75,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -90,6 +103,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private val Red = Color(0xFFE53935)
@@ -195,6 +209,70 @@ fun App(activity: MainActivity) {
     var tab by remember { mutableIntStateOf(0) }
     var folder by remember { mutableStateOf<String?>(null) }
 
+    // ---- file actions (delete / rename / share) ----
+    // Android asks the user "Allow Soft Video to ..." first; afterGrant runs only if they tap Allow
+    val scope = rememberCoroutineScope()
+    var afterGrant by remember { mutableStateOf<(() -> Unit)?>(null) }
+    var renameTarget by remember { mutableStateOf<Video?>(null) }
+    val grantLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { r ->
+        if (r.resultCode == Activity.RESULT_OK) afterGrant?.invoke()
+        afterGrant = null
+    }
+
+    fun askThen(pi: PendingIntent, then: () -> Unit) {
+        afterGrant = then
+        grantLauncher.launch(IntentSenderRequest.Builder(pi).build())
+    }
+
+    fun toast(msg: String) = Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show()
+
+    fun delete(v: Video) {
+        askThen(MediaStore.createDeleteRequest(ctx.contentResolver, listOf(v.uri))) {
+            videos = videos.filter { it.id != v.id }
+            activity.prefs.edit().remove("pos_${v.id}").apply()
+            toast("Deleted")
+        }
+    }
+
+    fun rename(v: Video, title: String) {
+        askThen(MediaStore.createWriteRequest(ctx.contentResolver, listOf(v.uri))) {
+            scope.launch {
+                val f = withContext(Dispatchers.IO) { renameVideo(ctx, v, title) }
+                if (f != null) {
+                    videos = videos.map { if (it.id == v.id) it.copy(title = title, file = f) else it }
+                    toast("Renamed")
+                } else {
+                    toast("Rename failed (a file with that name may already exist)")
+                }
+            }
+        }
+    }
+
+    fun fileActions(v: Video) = listOf<Pair<String, () -> Unit>>(
+        "Rename" to { renameTarget = v },
+        "Share" to { shareVideo(ctx, v) },
+        "Delete from device" to { delete(v) }
+    )
+
+    renameTarget?.let { v ->
+        var name by remember(v.id) { mutableStateOf(v.title) }
+        AlertDialog(
+            onDismissRequest = { renameTarget = null },
+            title = { Text("Rename") },
+            text = { OutlinedTextField(value = name, onValueChange = { name = it }, singleLine = true) },
+            confirmButton = {
+                TextButton(onClick = {
+                    val n = name.trim()
+                    if (n.isNotEmpty() && n != v.title) rename(v, n)
+                    renameTarget = null
+                }) { Text("Rename") }
+            },
+            dismissButton = { TextButton(onClick = { renameTarget = null }) { Text("Cancel") } }
+        )
+    }
+
     BackHandler(enabled = activity.playerOpen) { activity.closePlayer() }
     BackHandler(enabled = !activity.playerOpen && tab == 1 && folder != null) { folder = null }
 
@@ -203,7 +281,11 @@ fun App(activity: MainActivity) {
         return
     }
 
-    Column(Modifier.fillMaxSize()) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .systemBarsPadding()
+    ) {
         Row(
             Modifier
                 .fillMaxWidth()
@@ -234,7 +316,7 @@ fun App(activity: MainActivity) {
                 Button(onClick = { launcher.launch(perm) }) { Text("Allow") }
             }
         } else if (tab == 0) {
-            VideoList(videos) { i -> activity.startPlayback(videos, i) }
+            VideoList(videos, { fileActions(it) }) { i -> activity.startPlayback(videos, i) }
         } else {
             val current = folder
             if (current == null) {
@@ -275,14 +357,18 @@ fun App(activity: MainActivity) {
                     }
                     Text(current, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
-                VideoList(list) { i -> activity.startPlayback(list, i) }
+                VideoList(list, { fileActions(it) }) { i -> activity.startPlayback(list, i) }
             }
         }
     }
 }
 
 @Composable
-fun VideoList(list: List<Video>, onPlay: (Int) -> Unit) {
+fun VideoList(
+    list: List<Video>,
+    actions: (Video) -> List<Pair<String, () -> Unit>>,
+    onPlay: (Int) -> Unit
+) {
     if (list.isEmpty()) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Text("No videos found", color = Color.Gray)
@@ -291,6 +377,7 @@ fun VideoList(list: List<Video>, onPlay: (Int) -> Unit) {
     }
     LazyColumn(Modifier.fillMaxSize()) {
         itemsIndexed(list, key = { _, v -> v.id }) { i, v ->
+            var menuOpen by remember { mutableStateOf(false) }
             Row(
                 Modifier
                     .fillMaxWidth()
@@ -317,9 +404,25 @@ fun VideoList(list: List<Video>, onPlay: (Int) -> Unit) {
                     )
                 }
                 Spacer(Modifier.width(12.dp))
-                Column {
+                Column(Modifier.weight(1f)) {
                     Text(v.title, maxLines = 2, overflow = TextOverflow.Ellipsis)
                     Text(v.folder, color = Color.Gray, fontSize = 12.sp, maxLines = 1)
+                }
+                Box {
+                    IconButton(onClick = { menuOpen = true }) {
+                        Icon(Icons.Filled.MoreVert, "More", tint = Color.Gray)
+                    }
+                    DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                        actions(v).forEach { (label, fn) ->
+                            DropdownMenuItem(
+                                text = { Text(label) },
+                                onClick = {
+                                    menuOpen = false
+                                    fn()
+                                }
+                            )
+                        }
+                    }
                 }
             }
         }
